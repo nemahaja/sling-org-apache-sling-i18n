@@ -18,12 +18,6 @@
  */
 package org.apache.sling.i18n.impl;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotSame;
-import static org.junit.Assert.assertSame;
-import static org.junit.Assert.fail;
-import static org.mockito.ArgumentMatchers.any;
-
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -35,6 +29,7 @@ import java.util.ResourceBundle;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -52,6 +47,14 @@ import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.mockito.Mockito;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.any;
+
 /**
  * Test case to verify that each bundle is only loaded once, even
  * if concurrent requests for the same bundle are made.
@@ -67,7 +70,8 @@ public class ConcurrentJcrResourceBundleLoadingTest {
         return Arrays.asList(Boolean.TRUE, Boolean.FALSE);
     }
 
-    @Parameterized.Parameter public Boolean preload = Boolean.FALSE;
+    @Parameterized.Parameter
+    public Boolean preload = Boolean.FALSE;
 
     private JcrResourceBundleProvider provider;
 
@@ -77,16 +81,20 @@ public class ConcurrentJcrResourceBundleLoadingTest {
         Scheduler mockScheduler = context.registerService(Scheduler.class, Mockito.mock(Scheduler.class));
         // mock this call to avoid a NPE during activation
         Mockito.doAnswer(invocation -> {
-            return Mockito.mock(ScheduleOptions.class);
-        }).when(mockScheduler).NOW();
+                    return Mockito.mock(ScheduleOptions.class);
+                })
+                .when(mockScheduler)
+                .NOW();
         // Mock the schedule call so we do not wait for the "ResourceBundleProvider: reload all resource bundles"
         //   scheduled job to be completed during activation.  That background schedule execution can interfere with
         //   the multi-threaded tests (i.e. the cache gets reset in the middle of doing something)
         Mockito.doAnswer(invocation -> {
-            Runnable runnable = invocation.getArgument(0, Runnable.class);
-            runnable.run();
-            return null;
-        }).when(mockScheduler).schedule(any(Runnable.class), any(ScheduleOptions.class));
+                    Runnable runnable = invocation.getArgument(0, Runnable.class);
+                    runnable.run();
+                    return null;
+                })
+                .when(mockScheduler)
+                .schedule(any(Runnable.class), any(ScheduleOptions.class));
         context.registerService(ServiceUserMapped.class, Mockito.mock(ServiceUserMapped.class));
 
         Map<String, Object> configMap = new HashMap<>();
@@ -181,20 +189,22 @@ public class ConcurrentJcrResourceBundleLoadingTest {
 
         ScheduledExecutorService executorService = Executors.newScheduledThreadPool(1);
         executorService.scheduleAtFixedRate(
-            () -> {
-                ResourceBundle currentBundle = provider.getResourceBundle(Locale.ENGLISH);
-                if (currentBundle != english) {
-                    // Shutdown the executor once we got the new ResourceBundle. This will cancel the future and opens the gate below.
-                    // Do not assert the returned bundle directly here, as this may become flaky when the bundle returned by the
-                    // mock above was returned but not yet put into the cache.
-                    executorService.shutdownNow();
-                    newBundleReturned.countDown();
-                }
-            },
-            // start with an initial delay to not call getResourceBundle again before we call reloadBundle below
-            200,
-            200,
-            TimeUnit.MILLISECONDS);
+                () -> {
+                    ResourceBundle currentBundle = provider.getResourceBundle(Locale.ENGLISH);
+                    if (currentBundle != english) {
+                        // Shutdown the executor once we got the new ResourceBundle. This will cancel the future and
+                        // opens the gate below.
+                        // Do not assert the returned bundle directly here, as this may become flaky when the bundle
+                        // returned by the
+                        // mock above was returned but not yet put into the cache.
+                        executorService.shutdownNow();
+                        newBundleReturned.countDown();
+                    }
+                },
+                // start with an initial delay to not call getResourceBundle again before we call reloadBundle below
+                200,
+                200,
+                TimeUnit.MILLISECONDS);
 
         provider.reloadBundle(new Key(null, Locale.ENGLISH));
 
@@ -207,5 +217,68 @@ public class ConcurrentJcrResourceBundleLoadingTest {
 
         ResourceBundle english2 = provider.getResourceBundle(Locale.ENGLISH);
         assertNotSame(english2, english);
+    }
+
+    /**
+     * Verify that no exception occurs if requests come in during deactivate
+     */
+    @Test
+    public void loadBundlesDuringDeactivateRace() {
+        provider.deactivate();
+        assertNotNull(provider.getResourceBundle(Locale.ENGLISH));
+    }
+
+    /**
+     * Verify that the registry is cleared completely and all services are deregistered
+     * so no service is leftover even if registering and clearing occur in an interleaved manner.
+     */
+    @Test
+    public void clearCacheInterleavedWithRegistersClearsAllRBs() throws Exception {
+        Map<Locale, List<ResourceBundle>> rbLists = new ConcurrentHashMap<>();
+        final Locale[] testLocales = {
+            Locale.ENGLISH,
+            Locale.FRENCH,
+            Locale.GERMAN,
+            Locale.ITALIAN,
+            Locale.JAPANESE,
+            Locale.KOREAN,
+            Locale.CHINESE,
+            Locale.SIMPLIFIED_CHINESE,
+            Locale.TRADITIONAL_CHINESE
+        };
+
+        final int numberOfThreads = 100;
+        // Use a barrier to start the execution of all the threads simultaneously once they are all ready
+        final CyclicBarrier barrier = new CyclicBarrier(numberOfThreads);
+        final ExecutorService pool = Executors.newFixedThreadPool(numberOfThreads);
+        for (int i = 0; i < numberOfThreads; i++) {
+            pool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        barrier.await();
+                        for (Locale locale : testLocales) {
+                            ResourceBundle rb = provider.getResourceBundle(locale);
+                            List<ResourceBundle> rbList = rbLists.computeIfAbsent(locale, key -> new ArrayList<>());
+                            rbList.add(rb);
+                        }
+                        // trigger registry clearing and service deregistration
+                        provider.clearCache();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            });
+        }
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+
+        // getResourceBundle should return a new ResourceBundle instance,
+        // not one that might be left in the cache by an incomplete clearing
+        for (Locale locale : testLocales) {
+            ResourceBundle rb = provider.getResourceBundle(locale);
+            List<ResourceBundle> rbList = rbLists.get(locale);
+            assertFalse(rbList.contains(rb));
+        }
     }
 }
